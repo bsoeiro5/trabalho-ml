@@ -1,0 +1,19 @@
+# Bidirectional GRU (+ attention pooling) on MFCC (+ deltas) sequences of 4 s windows.
+inherit: base.yaml
+name: rnn
+device_preference: [cuda, cpu]        # small GRUs train ~2.5x faster on the CPU than on Apple MPS
+
+features:
+  kind: mfcc
+  hop_length: 64            # 32 ms frames -> 126 time steps per 4 s window
+  n_mfcc: 20
+  deltas: true              # 20 MFCC + 20 deltas + 20 delta-deltas = 60 features per frame
+  spec_augment: {freq_masks: 2, freq_width: 8, time_masks: 2, time_width: 10}
+
+model:
+  type: rnn
+  cell: gru
+  hidden: 64
+  layers: 2
+  bidirectional: true
+  dropout: 0.3

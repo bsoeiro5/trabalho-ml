@@ -1,0 +1,50 @@
+# Shared settings of every experiment (cnn.yaml / rnn.yaml extend this file).
+name: base
+seed: 42
+output_dir: outputs
+cache_dir: cache
+device_preference: [cuda, mps, cpu]   # first available device is used (override with --device)
+
+data:
+  dir: data/circor
+  splits: splits/splits.csv
+  label_mode: location      # recording label: "location" (uses Murmur locations) or "patient"
+
+audio:
+  fs: 2000                  # target sampling rate (Hz); recordings are 4000 Hz
+  band: [25, 800]           # band-pass filter (Hz)
+
+windows:
+  length_s: 4.0             # fixed-length input: several cardiac cycles (60-160 bpm)
+  eval_hop_s: 2.0           # 50% overlap between windows at evaluation time
+
+features:
+  kind: logmel              # logmel | mfcc
+  n_fft: 256
+  win_length: 128           # 64 ms
+  hop_length: 32            # 16 ms -> 251 frames per 4 s window
+  n_mels: 64
+  fmin: 25
+  fmax: 800
+  spec_augment: {freq_masks: 2, freq_width: 8, time_masks: 2, time_width: 20}
+
+train:
+  epochs: 60
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-2
+  crops_per_recording: 4    # random crops of every recording per epoch
+  class_weights: challenge  # challenge (5,3,1) | balanced | none | [w_P, w_U, w_A]
+  label_smoothing: 0.0
+  patience: 12              # early stopping on the validation patient-level WA
+  grad_clip: 5.0
+  augment:
+    gain_db: 6              # random gain in [-6, 6] dB
+    noise_snr_db: [10, 40]  # additive white noise...
+    noise_p: 0.5            # ...on half of the crops
+    speed: [0.9, 1.1]       # time-stretch (heart rate variation)...
+    speed_p: 0.5            # ...on half of the crops
+
+decision:
+  methods: [mean, max]      # recording -> patient aggregations compared on the dev CV
+  monitor: max              # aggregation used for early stopping

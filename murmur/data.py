@@ -1,14 +1,24 @@
-"""Metadata of the CirCor DigiScope dataset: patients, recordings and labels."""
+"""Data: metadata of the CirCor DigiScope dataset, labels, subject-level splits and audio pre-processing."""
+import hashlib
+import json
 import os
+import warnings
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.io import wavfile
+from scipy.signal import butter, resample_poly, sosfiltfilt
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
+from tqdm import tqdm
 
 CLASSES = ["Present", "Unknown", "Absent"]  # same order as the Challenge
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 WA_WEIGHTS = np.array([5.0, 3.0, 1.0])  # class weights of the weighted accuracy
 
+
+# ----------------------------------------------------------------------------- metadata
 
 def recordings_dir(data_dir):
     """`training_data/` inside the PhysioNet folder, or the folder itself (e.g. hidden data)."""
@@ -117,6 +127,8 @@ def recording_labels(recordings, patients, mode="location"):
     mode="location": recordings of a Present patient are Present only if the murmur
                      was heard at their location (field `Murmur locations`), else Absent.
     """
+    if mode not in ("location", "patient"):
+        raise ValueError(f"unknown label mode {mode!r}")
     pat = patients.set_index("patient_id")
     labels = []
     for pid, loc in zip(recordings["patient_id"], recordings["location"]):
@@ -124,7 +136,102 @@ def recording_labels(recordings, patients, mode="location"):
         locs = pat.at[pid, "murmur_locations"]
         if mode == "location" and label == "Present" and isinstance(locs, str):
             label = "Present" if loc in locs.split("+") else "Absent"
-        elif mode not in ("location", "patient"):
-            raise ValueError(f"unknown label mode {mode!r}")
         labels.append(CLASS_TO_IDX[label])
     return np.array(labels, dtype=int)
+
+
+# ----------------------------------------------------------------------------- splits
+
+def _group_folds(strata, groups, n_folds, seed):
+    x = np.zeros(len(strata))
+    with warnings.catch_warnings():  # tiny strata (e.g. Unknown x CC2014) trigger a warning
+        warnings.simplefilter("ignore", UserWarning)
+        try:
+            sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            return [val for _, val in sgkf.split(x, strata, groups)]
+        except ValueError:  # every stratum smaller than n_folds (only on tiny datasets): grouped only
+            return [val for _, val in GroupKFold(n_splits=n_folds).split(x, strata, groups)]
+
+
+def make_splits(patients, n_folds=5, test_fraction=0.2, seed=42):
+    """Hold out a test set, then split the remaining (dev) patients into CV folds.
+
+    Splits are grouped by subject (a child recorded in both campaigns has two patient
+    ids) and stratified by murmur label x campaign. Columns of the result:
+      subset    dev / test
+      fold      CV fold of the dev patients (-1 for test patients)
+      fold_all  folds over all patients, only used to retrain the final model on
+                everything once the test evaluation is done
+    """
+    patients = patients.reset_index(drop=True)
+    df = patients[["patient_id", "murmur", "campaign"]].copy()
+    df["subject_id"] = subject_ids(patients)
+    strata = (df["murmur"] + "|" + df["campaign"].fillna("")).to_numpy()
+    groups = df["subject_id"].to_numpy()
+
+    test_idx = _group_folds(strata, groups, int(round(1 / test_fraction)), seed)[0]
+    df["subset"] = "dev"
+    df.loc[test_idx, "subset"] = "test"
+
+    df["fold"] = -1
+    df["fold_all"] = -1
+    for subset, columns in [("dev", ["fold", "fold_all"]), ("test", ["fold_all"])]:
+        idx = np.flatnonzero(df["subset"] == subset)
+        for k, val in enumerate(_group_folds(strata[idx], groups[idx], n_folds, seed)):
+            df.loc[idx[val], columns] = k
+    return df
+
+
+# ----------------------------------------------------------------------------- audio
+
+def load_wav(path):
+    """Read a wav file as float32 in [-1, 1]; returns (signal, sampling rate)."""
+    fs, x = wavfile.read(path)
+    if x.ndim > 1:
+        x = x[:, 0]
+    if np.issubdtype(x.dtype, np.integer):
+        x = x.astype(np.float32) / np.iinfo(x.dtype).max
+    return x.astype(np.float32), fs
+
+
+def preprocess(x, fs, target_fs=2000, band=(25.0, 800.0)):
+    """Band-pass filter, resample to `target_fs` and standardise (zero mean, unit variance).
+
+    The band keeps the heart sounds (S1/S2, mostly < 200 Hz) and the murmurs (up to
+    ~600 Hz) while removing very low-frequency noise (movement, breathing) and
+    high-frequency noise. Resampling 4000 -> 2000 Hz halves the cost without losing
+    information inside the band.
+    """
+    sos = butter(4, band, btype="bandpass", fs=fs, output="sos")
+    x = sosfiltfilt(sos, x)
+    if fs != target_fs:
+        g = gcd(int(fs), int(target_fs))
+        x = resample_poly(x, int(target_fs) // g, int(fs) // g)
+    x = x - x.mean()
+    return (x / (x.std() + 1e-8)).astype(np.float32)
+
+
+def load_signals(recordings, audio_cfg, cache_dir=None):
+    """Pre-processed signal of every recording, as a dict rec_id -> float16 array.
+
+    The result is cached on disk; the cache key depends on the files and on the
+    pre-processing parameters, so changing either rebuilds it.
+    """
+    target_fs, band = audio_cfg["fs"], tuple(audio_cfg["band"])
+    files = sorted(str(Path(p).resolve()) for p in recordings["wav_path"])
+    key = json.dumps({"files": files, "fs": target_fs, "band": band})
+    path = None
+    if cache_dir:
+        path = Path(cache_dir) / f"signals_{hashlib.md5(key.encode()).hexdigest()[:12]}.npz"
+        if path.exists():
+            with np.load(path) as f:
+                return {k: f[k] for k in f.files}
+    signals = {}
+    items = zip(recordings["rec_id"], recordings["wav_path"])
+    for rec_id, wav in tqdm(items, total=len(recordings), desc="pre-processing audio"):
+        x, fs = load_wav(wav)
+        signals[rec_id] = preprocess(x, fs, target_fs, band).astype(np.float16)
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(path, **signals)
+    return signals

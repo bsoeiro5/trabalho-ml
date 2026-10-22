@@ -6,8 +6,8 @@ cache_dir: cache
 device_preference: [cuda, mps, cpu]   # first available device is used (override with --device)
 
 data:
-  dir: data/circor
-  splits: splits/splits.csv
+  dir: ../circor-dataset    # dataset folder (training_data.csv + training_data/)
+  splits: configs/splits.csv
   label_mode: location      # recording label: "location" (uses Murmur locations) or "patient"
 
 audio:
@@ -36,7 +36,9 @@ train:
   crops_per_recording: 4    # random crops of every recording per epoch
   class_weights: challenge  # challenge (5,3,1) | balanced | none | [w_P, w_U, w_A]
   label_smoothing: 0.0
-  patience: 12              # early stopping on the validation patient-level WA
+  patience: 12              # epochs without improvement before stopping
+  early_stopping: wa        # criterion: wa (patient-level WA on validation) | loss (validation loss)
+  ema: 0                    # decay of the exponential moving average of the weights (0 = off)
   grad_clip: 5.0
   augment:
     gain_db: 6              # random gain in [-6, 6] dB

@@ -17,27 +17,21 @@ A métrica principal é a *weighted accuracy* ao nível do paciente, com pesos 5
 ## Estrutura do repositório
 
 ```
-configs/          configurações YAML (base.yaml, cnn.yaml, rnn.yaml, smoke.yaml)
-murmur/           código (pacote Python)
-  data.py           metadados, labels por gravação, sujeitos (IDs duplicados)
-  splits.py         splits por sujeito, estratificados
-  audio.py          leitura, filtragem, reamostragem, normalização, cache
-  features.py       log-mel / MFCC / SpecAugment em PyTorch (calculados na GPU)
-  models.py         CNN2D, RNN (GRU/LSTM + atenção)
-  engine.py         treino (recortes aleatórios, augmentation, early stopping) e inferência
-  aggregation.py    gravações -> paciente, regra de decisão
-  metrics.py        weighted accuracy, matriz de confusão, métricas adicionais, bootstrap
-  interpret.py      atenção do RNN / saliência da CNN vs segmentação S1-sístole-S2-diástole
-  prepare.py        CLI: splits + cache de áudio
-  cv.py             CLI: validação cruzada no dev (um modelo por fold + previsões out-of-fold)
-  evaluate.py       CLI: avaliação final no teste (ou só CV de um ensemble com --dev-only)
-  predict.py        CLI: previsões para dados novos (bónus) -> CSV patient_id,murmur
-  report.py         CLI: tabela comparativa e figuras de todas as experiências
-notebooks/        01_eda.ipynb (análise exploratória), 02_results.ipynb (resultados e interpretação)
-scripts/          download_data.sh, run_all.sh, run_experiments.sh, make_synthetic_data.py
-splits/           splits.csv (fixo, seed 42; igual para todos os membros do grupo)
-docs/             experiment_log.md (registo de experiências), slides_outline.md
-tests/            testes (pytest)
+murmur/                 código (pacote Python)
+  data.py                 metadados, labels por gravação, sujeitos, splits, leitura e pré-processamento do áudio
+  features.py             log-mel, MFCC, SpecAugment (em PyTorch, calculados na GPU)
+  models.py               CNN 2D e RNN (GRU/LSTM + atenção)
+  training.py             treino (recortes aleatórios, augmentation, early stopping) e inferência por janelas
+  evaluation.py           weighted accuracy, matriz de confusão, agregação gravações -> paciente, regra de decisão
+  interpret.py            atenção do RNN / saliência da CNN vs fases do ciclo cardíaco
+  plots.py                figuras
+  utils.py                configuração YAML, seed, device, logging
+  pipeline.py             comandos: prepare, cv, evaluate, predict, report
+configs/                base.yaml, cnn.yaml, rnn.yaml, splits.csv (splits fixos, iguais para todo o grupo)
+notebooks/              01_eda.ipynb (análise exploratória), 02_results.ipynb (resultados e interpretação)
+scripts/                download_data.sh, experiments.sh (todas as experiências por ordem)
+tests/                  testes unitários + teste de ponta a ponta com dados sintéticos
+experiments.md          registo das experiências e plano dos slides
 ```
 
 ## Instalação
@@ -54,54 +48,44 @@ No portátil do Bernardo, o env `datasci` já tem tudo (`conda activate datasci`
 
 ## Dados
 
-```bash
-bash scripts/download_data.sh          # zip de ~470 MB; se a ligação cair, correr de novo (retoma)
+O código espera o dataset **ao lado do repositório**, em `../circor-dataset` (`data.dir` em
+`configs/base.yaml`):
+
+```
+ac2/
+├── circor-dataset/        training_data.csv + training_data/*.wav|.hea|.tsv|.txt
+└── trabalho-ml/           este repositório
 ```
 
-No fim deve existir `data/circor/training_data.csv` e `data/circor/training_data/` com os ficheiros
-`.wav/.hea/.tsv/.txt`. Em alternativa, descarregar o zip de
-<https://physionet.org/content/circor-heart-sound/1.0.3/> e extrair para `data/circor/`.
-Os dados **não** vão para o git.
+Para o descarregar: `bash scripts/download_data.sh` (zip de ~470 MB, retoma se a ligação cair), ou
+manualmente em <https://physionet.org/content/circor-heart-sound/1.0.3/>.
 
 ## Como correr
 
-**Teste rápido sem descarregar nada** (dataset sintético no mesmo formato, ~2 min):
-
 ```bash
-python scripts/make_synthetic_data.py --out data/synthetic
-python -m murmur.prepare --config configs/base.yaml configs/smoke.yaml
-python -m murmur.cv --config configs/cnn.yaml configs/smoke.yaml
-python -m murmur.cv --config configs/rnn.yaml configs/smoke.yaml
-python -m murmur.report --output-dir outputs/smoke
-pytest -q
+python -m murmur prepare                                   # cache de áudio (os splits já existem)
+python -m murmur cv --config configs/cnn.yaml              # 5 folds, ~25 min (GPU/MPS)
+python -m murmur cv --config configs/rnn.yaml              # 5 folds, ~60 min (CPU); pode correr em paralelo
+python -m murmur evaluate --exp cnn rnn --dev-only         # CV do ensemble, sem tocar no teste
+python -m murmur report                                    # tabela + figuras em outputs/report/
+python -m murmur evaluate --exp cnn                        # TESTE: só no fim, uma vez
 ```
 
-**Pipeline real** (o mesmo que `scripts/run_all.sh`):
-
-```bash
-python -m murmur.prepare --config configs/base.yaml        # cache de áudio (splits já existem)
-python -m murmur.cv --config configs/cnn.yaml              # ~45 min (GPU/MPS)
-python -m murmur.cv --config configs/rnn.yaml              # ~60 min (CPU); pode correr em paralelo com o anterior
-python -m murmur.evaluate --exp cnn rnn --dev-only         # CV do ensemble, sem tocar no teste
-python -m murmur.report                                    # tabela + figuras em outputs/report/
-python -m murmur.evaluate --exp cnn                        # TESTE: só no fim, uma vez
-python -m murmur.evaluate --exp rnn
-```
-
-Experiências / ablações: `bash scripts/run_experiments.sh` (ou uma a uma com
-`python -m murmur.cv --config configs/cnn.yaml --name cnn_lr3e-4 --set train.lr=3e-4`).
-Os resultados vão para `docs/experiment_log.md`.
-
-**Bónus (dados escondidos):** depois da avaliação no teste, retreinar com todos os pacientes e prever:
-
-```bash
-python -m murmur.cv --config configs/cnn.yaml --all-data   # -> outputs/cnn_all
-python -m murmur.cv --config configs/rnn.yaml --all-data   # -> outputs/rnn_all
-python -m murmur.predict --exp cnn_all rnn_all --data-dir data/hidden --out predictions.csv
-```
+- `python -m murmur --help` mostra todos os comandos.
+- Para mudar um hiperparâmetro sem criar ficheiros: `python -m murmur cv --config configs/cnn.yaml --name cnn_lr3e-4 --set train.lr=3e-4`.
+- Todas as experiências do relatório: `bash scripts/experiments.sh` (as que já acabaram são saltadas).
+- Testes (~1 min, não precisam dos dados reais): `pytest -q`.
 
 Cada experiência fica em `outputs/<nome>/`: `config.yaml`, `train.log`, `fold<k>/model.pt`,
 `fold<k>/history.csv`, `oof_recordings.csv`, `cv_summary.json` e, depois da avaliação, `test/`.
+
+**Bónus (dados escondidos).** Depois da avaliação no teste, retreinar com todos os pacientes e prever:
+
+```bash
+python -m murmur cv --config configs/cnn.yaml --all-data   # -> outputs/cnn_all
+python -m murmur cv --config configs/rnn.yaml --all-data   # -> outputs/rnn_all
+python -m murmur predict --exp cnn_all rnn_all --data-dir ../hidden-data --out predictions.csv
+```
 
 ---
 
@@ -110,7 +94,7 @@ Cada experiência fica em `outputs/<nome>/`: `config.yaml`, `train.log`, `fold<k
 | Passo | Detalhe |
 |---|---|
 | Unidade de divisão | **Sujeito**, não `Patient ID`: 140 IDs são 70 crianças gravadas nas duas campanhas (campo `Additional ID`). Dividir só por ID poria a mesma criança em treino e teste. |
-| Teste (hold-out) | 20%: **189 pacientes** (36 P / 14 U / 139 A), estratificado por label × campanha (`splits/splits.csv`, seed 42). |
+| Teste (hold-out) | 20%: **189 pacientes** (36 P / 14 U / 139 A), estratificado por label × campanha (`configs/splits.csv`, seed 42). |
 | Desenvolvimento | 753 pacientes, **5 folds** estratificados por sujeito (~150 pacientes/fold). |
 | Treino / validação | Em cada fold: treino em 4 folds, *early stopping* no 5.º. Isto dá previsões *out-of-fold* (OOF) para todos os pacientes dev. |
 | Escolhas | Arquitetura, hiperparâmetros, agregação e regra de decisão: **só com as previsões OOF do dev**. |
@@ -177,7 +161,7 @@ em *cross-fitting*: nos dados sintéticos, um modelo mal treinado piorava com a 
 - AdamW (lr 1e-3, weight decay 1e-2), batch 64, 1 época de *warm-up* + *cosine decay*, *gradient clipping* 5.
 - Até 60 épocas, com *early stopping* (paciência 12) na WA de validação ao nível do paciente, a métrica que interessa.
 - *Augmentation*: recortes aleatórios, *time-stretch* ±10% (simula frequência cardíaca), ganho ±6 dB, ruído branco com SNR 10–40 dB, SpecAugment (máscaras de frequência e de tempo).
-- Os valores iniciais vêm da literatura (PANNs, SpecAugment, equipas do Challenge) e são ajustados com as ablações da CV (`docs/experiment_log.md`).
+- Os valores iniciais vêm da literatura (PANNs, SpecAugment, equipas do Challenge) e são ajustados com as ablações da CV (`experiments.md`).
 
 ## Calendário
 
@@ -187,4 +171,4 @@ em *cross-fitting*: nos dados sintéticos, um modelo mal treinado piorava com a 
 | 30 nov 2026, 23:59 | Entrega no Moodle: código, slides (PDF, 10 min), `predictions.csv` do bónus, autoavaliação |
 | 3 e 10 dez 2026 | Apresentações (presença obrigatória de todos) |
 
-Estrutura proposta para os slides: `docs/slides_outline.md`.
+Registo das experiências e estrutura dos slides: `experiments.md`.

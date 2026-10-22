@@ -1,4 +1,4 @@
-"""Training and inference loops."""
+"""Training (random crops, augmentation, early stopping) and sliding-window inference."""
 import copy
 import math
 import time
@@ -10,9 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from .aggregation import PROB_COLS, decide, patient_scores
 from .data import WA_WEIGHTS
-from .metrics import weighted_accuracy
+from .evaluation import PROB_COLS, decide, patient_scores, weighted_accuracy
 from .models import build_model, count_parameters
 
 
@@ -127,8 +126,36 @@ def patient_wa(val_rec, probs, patient_labels, method):
     return weighted_accuracy(patient_labels.loc[scores.index].to_numpy(), decide(scores.to_numpy()))
 
 
+class EMA:
+    """Exponential moving average of the weights.
+
+    Evaluating the averaged weights instead of the raw ones smooths the epoch-to-epoch
+    noise of the validation metrics (and usually generalises slightly better).
+    """
+
+    def __init__(self, model, decay):
+        self.decay, self.steps = decay, 0
+        self.model = copy.deepcopy(model).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        self.steps += 1
+        d = min(self.decay, (1 + self.steps) / (10 + self.steps))  # shorter average at the start
+        for e, m in zip(self.model.state_dict().values(), model.state_dict().values()):
+            if e.dtype.is_floating_point:
+                e.mul_(d).add_(m, alpha=1 - d)
+            else:
+                e.copy_(m)
+
+
 def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_labels, device, log=print):
-    """Train one model, with early stopping on the patient-level WA of the validation patients.
+    """Train one model, with early stopping on the validation patients.
+
+    The early-stopping criterion (`train.early_stopping`) is the patient-level WA
+    ("wa", ties broken by the loss) or the validation loss ("loss"). With `train.ema`
+    the exponential moving average of the weights is evaluated and returned.
 
     train_signals / train_labels: lists of training recordings and their labels.
     val_rec: DataFrame of the validation recordings (patient_id, label), aligned with val_signals.
@@ -156,6 +183,8 @@ def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_
     val_windows, val_owner = make_windows(val_signals, length, hop)
     val_window_labels = torch.as_tensor(val_rec["label"].to_numpy()[val_owner])
     monitor = cfg["decision"]["monitor"]
+    by_loss = tcfg.get("early_stopping", "wa") == "loss"
+    ema = EMA(model, tcfg["ema"]) if tcfg.get("ema") else None
     best_key, best_state, bad, history = None, None, 0, []
 
     for epoch in range(1, tcfg["epochs"] + 1):
@@ -171,10 +200,13 @@ def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_
             nn.utils.clip_grad_norm_(model.parameters(), tcfg.get("grad_clip", 5.0))
             optimizer.step()
             scheduler.step()
+            if ema:
+                ema.update(model)
             running += loss.detach()
             n_batches += 1
 
-        p_win = predict_windows(model, val_windows, device)
+        evaluated = ema.model if ema else model
+        p_win = predict_windows(evaluated, val_windows, device)
         val_loss = F.nll_loss(torch.log(torch.as_tensor(p_win) + 1e-8), val_window_labels, weight=weights.cpu()).item()
         rec_probs = mean_by_owner(p_win, val_owner, len(val_signals))
         val_wa = patient_wa(val_rec, rec_probs, patient_labels, monitor)
@@ -182,10 +214,10 @@ def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_
                "val_wa": val_wa, "lr": optimizer.param_groups[0]["lr"], "time_s": time.time() - t0}
         history.append(row)
 
-        key = (val_wa, -val_loss)  # best WA, ties broken by the validation loss
+        key = (-val_loss, val_wa) if by_loss else (val_wa, -val_loss)
         improved = best_key is None or key > best_key
         if improved:
-            best_key, best_state, bad = key, copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()}), 0
+            best_key, best_state, bad = key, {k: v.detach().cpu().clone() for k, v in evaluated.state_dict().items()}, 0
         else:
             bad += 1
         log(f"  epoch {epoch:3d}  train_loss {row['train_loss']:.4f}  val_loss {val_loss:.4f}  "

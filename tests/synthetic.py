@@ -1,6 +1,6 @@
-"""Generate a small synthetic dataset in the CirCor DigiScope format, to test the code without the real data.
+"""Small synthetic dataset in the CirCor DigiScope format, used by the end-to-end test (tests/test_pipeline.py).
 
-    python scripts/make_synthetic_data.py --out data/synthetic --n-patients 150
+    python tests/synthetic.py --out /tmp/synthetic --n-patients 150     # to inspect it by hand
 
 The signals are crude imitations of phonocardiograms: S1/S2 bursts at a random heart
 rate; recordings where a murmur is "heard" get band-limited noise during systole, and
@@ -59,22 +59,17 @@ def synth_recording(duration, murmur, noisy, rng):
     return (x * 32767).astype(np.int16), segments
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", default="data/synthetic")
-    parser.add_argument("--n-patients", type=int, default=150)
-    parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args(argv)
-
-    rng = np.random.default_rng(args.seed)
-    out = Path(args.out)
+def make_dataset(out, n_patients=150, seed=0):
+    """Write `n_patients` synthetic patients (training_data.csv + training_data/) to `out`; returns `out`."""
+    rng = np.random.default_rng(seed)
+    out = Path(out)
     rec_dir = out / "training_data"
     rec_dir.mkdir(parents=True, exist_ok=True)
 
-    ids = rng.choice(np.arange(10000, 90000), args.n_patients, replace=False)
-    labels = rng.choice(["Absent", "Present", "Unknown"], args.n_patients, p=[0.74, 0.19, 0.07])
+    ids = rng.choice(np.arange(10000, 90000), n_patients, replace=False)
+    labels = rng.choice(["Absent", "Present", "Unknown"], n_patients, p=[0.74, 0.19, 0.07])
     additional = {}
-    for a, b in rng.choice(args.n_patients, (args.n_patients // 20, 2), replace=False):  # ~10% seen twice
+    for a, b in rng.choice(n_patients, (n_patients // 20, 2), replace=False):  # ~10% seen twice
         additional[ids[a]], additional[ids[b]] = ids[b], ids[a]
         labels[b] = labels[a]
 
@@ -108,9 +103,13 @@ def main(argv=None):
     df = pd.DataFrame(rows, columns=COLUMNS)
     df["Additional ID"] = df["Additional ID"].astype("Int64")
     df.to_csv(out / "training_data.csv", index=False)
-    print(f"{len(df)} synthetic patients written to {out}")
-    print(df["Murmur"].value_counts().to_string())
+    return out
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--n-patients", type=int, default=150)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    print(f"synthetic dataset written to {make_dataset(args.out, args.n_patients, args.seed)}")

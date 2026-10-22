@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Download the public CirCor DigiScope dataset (v1.0.3, zip of ~470 MB) into data/circor.
+# Download the public CirCor DigiScope dataset (v1.0.3, zip of ~470 MB) next to the repository.
 #
 #   bash scripts/download_data.sh [destination]
 #
 # The download resumes where it stopped if it is interrupted (just run it again).
 set -euo pipefail
 
-DEST="${1:-data/circor}"
+DEST="${1:-../circor-dataset}"   # the path used by configs/base.yaml (data.dir)
 URL="https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/"
 ZIP="$DEST/circor-1.0.3.zip"
 

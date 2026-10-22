@@ -21,7 +21,7 @@ murmur/                 código (pacote Python)
   data.py                 metadados, labels por gravação, sujeitos, splits, leitura e pré-processamento do áudio
   features.py             log-mel, MFCC, SpecAugment (em PyTorch, calculados na GPU)
   models.py               CNN 2D e RNN (GRU/LSTM + atenção)
-  training.py             treino (recortes aleatórios, augmentation, early stopping) e inferência por janelas
+  training.py             treino (recortes aleatórios, augmentation, EMA dos pesos) e inferência por janelas
   evaluation.py           weighted accuracy, matriz de confusão, agregação gravações -> paciente, regra de decisão
   interpret.py            atenção do RNN / saliência da CNN vs fases do ciclo cardíaco
   plots.py                figuras
@@ -72,6 +72,7 @@ python -m murmur evaluate --exp cnn                        # TESTE: só no fim, 
 ```
 
 - `python -m murmur --help` mostra todos os comandos.
+- Em paralelo: **uma** experiência na GPU (CNN) + **uma** no CPU (RNN). Duas na GPU (MPS) ao mesmo tempo ficam cada uma 2–4× mais lentas, o que é pior do que corrê-las seguidas.
 - Para mudar um hiperparâmetro sem criar ficheiros: `python -m murmur cv --config configs/cnn.yaml --name cnn_lr3e-4 --set train.lr=3e-4`.
 - Todas as experiências do relatório: `bash scripts/experiments.sh` (as que já acabaram são saltadas).
 - Testes (~1 min, não precisam dos dados reais): `pytest -q`.
@@ -96,7 +97,7 @@ python -m murmur predict --exp cnn_all rnn_all --data-dir ../hidden-data --out p
 | Unidade de divisão | **Sujeito**, não `Patient ID`: 140 IDs são 70 crianças gravadas nas duas campanhas (campo `Additional ID`). Dividir só por ID poria a mesma criança em treino e teste. |
 | Teste (hold-out) | 20%: **189 pacientes** (36 P / 14 U / 139 A), estratificado por label × campanha (`configs/splits.csv`, seed 42). |
 | Desenvolvimento | 753 pacientes, **5 folds** estratificados por sujeito (~150 pacientes/fold). |
-| Treino / validação | Em cada fold: treino em 4 folds, *early stopping* no 5.º. Isto dá previsões *out-of-fold* (OOF) para todos os pacientes dev. |
+| Treino / validação | Em cada fold: treino em 4 folds com um número **fixo** de épocas, e previsão no 5.º. Isto dá previsões *out-of-fold* (OOF) para todos os pacientes dev. A época **não** é escolhida no fold de validação, senão as previsões OOF ficam otimistas (ver Treino). |
 | Escolhas | Arquitetura, hiperparâmetros, agregação e regra de decisão: **só com as previsões OOF do dev**. |
 | WA de CV reportada | Média ± desvio-padrão nos 5 folds. Quando a regra usa multiplicadores afinados, os do fold *k* são afinados nos outros 4 folds (*cross-fitting*), e por isso nenhum paciente afina a sua própria decisão. |
 | Teste | Usado **uma vez**, no fim: ensemble dos 5 modelos dos folds + regra de decisão do OOF. Reportamos WA, matriz de confusão, IC 95% por bootstrap e WA de cada modelo individual (média ± dp). |
@@ -138,9 +139,11 @@ aproxima a decisão ótima para a métrica. Os pesos "inverso da frequência" e 
 comparados como ablação.
 
 **Regra de decisão.** Opcionalmente, multiplicadores para os scores *Present*/*Unknown* (grelha
-2^[-3, 3]), para corrigir a calibração e o efeito da agregação. Só são usados se baterem o argmax
-em *cross-fitting*: nos dados sintéticos, um modelo mal treinado piorava com a afinação
-(0.78 → 0.59), e o protocolo protege contra isso.
+2^[-3, 3]), para corrigir a calibração e o efeito da agregação. A regra (agregação × argmax/afinada)
+é escolhida pela WA de CV com *cross-fitting*. Fica a mais simples (argmax, agregação *max*), a não
+ser que outra ganhe por mais de 0.005, para não escolher regras por ruído.
+- Nos dados sintéticos, um modelo mal treinado piorava com a afinação (0.78 → 0.59), e o protocolo protege contra isso.
+- Nos dados reais, com *max*, a afinação não ajuda: a perda pesada já põe o argmax perto do ótimo, como previa o argumento de Bayes.
 
 **CNN 2D** (327 k parâmetros, inspirada nas PANNs, Kong et al. 2020).
 - Entrada: log-mel 64×251, com BatchNorm por banda.
@@ -159,7 +162,9 @@ em *cross-fitting*: nos dados sintéticos, um modelo mal treinado piorava com a 
 
 **Treino.**
 - AdamW (lr 1e-3, weight decay 1e-2), batch 64, 1 época de *warm-up* + *cosine decay*, *gradient clipping* 5.
-- Até 60 épocas, com *early stopping* (paciência 12) na WA de validação ao nível do paciente, a métrica que interessa.
+- **Número fixo de épocas** (cosine até 0) e avaliação dos **pesos EMA** (média móvel exponencial, 0.995).
+- Primeiro usámos *early stopping* na WA de validação. As curvas eram muito ruidosas (WA 0.61–0.85 entre épocas consecutivas) e a época escolhida era um pico de sorte, o que deixava as previsões OOF ~2 pontos otimistas (0.812 → 0.794 com épocas fixas).
+- Com a EMA as curvas ficam suaves e a WA estabiliza a partir da época ~9. Com 30 épocas fica ~1 ponto acima de 20 (0.794 vs 0.785, melhor ou igual em todos os folds): as ablações usam 20 épocas (mais baratas, comparações relativas) e o modelo final 30. Ver `experiments.md`.
 - *Augmentation*: recortes aleatórios, *time-stretch* ±10% (simula frequência cardíaca), ganho ±6 dB, ruído branco com SNR 10–40 dB, SpecAugment (máscaras de frequência e de tempo).
 - Os valores iniciais vêm da literatura (PANNs, SpecAugment, equipas do Challenge) e são ajustados com as ablações da CV (`experiments.md`).
 

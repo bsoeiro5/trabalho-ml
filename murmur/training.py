@@ -153,9 +153,12 @@ class EMA:
 def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_labels, device, log=print):
     """Train one model, with early stopping on the validation patients.
 
-    The early-stopping criterion (`train.early_stopping`) is the patient-level WA
-    ("wa", ties broken by the loss) or the validation loss ("loss"). With `train.ema`
-    the exponential moving average of the weights is evaluated and returned.
+    `train.early_stopping` selects the returned weights: the epoch with the best
+    patient-level WA ("wa", ties broken by the loss), the best validation loss ("loss"),
+    or simply the last epoch ("none": fixed schedule). Selecting the epoch on the
+    validation fold makes its out-of-fold predictions optimistic (the maximum of a noisy
+    curve), which "none" avoids. With `train.ema` the exponential moving average of the
+    weights is evaluated and returned.
 
     train_signals / train_labels: lists of training recordings and their labels.
     val_rec: DataFrame of the validation recordings (patient_id, label), aligned with val_signals.
@@ -183,7 +186,9 @@ def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_
     val_windows, val_owner = make_windows(val_signals, length, hop)
     val_window_labels = torch.as_tensor(val_rec["label"].to_numpy()[val_owner])
     monitor = cfg["decision"]["monitor"]
-    by_loss = tcfg.get("early_stopping", "wa") == "loss"
+    selection = tcfg.get("early_stopping", "wa")
+    if selection not in ("wa", "loss", "none"):
+        raise ValueError(f"unknown early_stopping {selection!r}")
     ema = EMA(model, tcfg["ema"]) if tcfg.get("ema") else None
     best_key, best_state, bad, history = None, None, 0, []
 
@@ -214,7 +219,7 @@ def train_model(cfg, train_signals, train_labels, val_rec, val_signals, patient_
                "val_wa": val_wa, "lr": optimizer.param_groups[0]["lr"], "time_s": time.time() - t0}
         history.append(row)
 
-        key = (-val_loss, val_wa) if by_loss else (val_wa, -val_loss)
+        key = {"wa": (val_wa, -val_loss), "loss": (-val_loss, val_wa), "none": (epoch,)}[selection]
         improved = best_key is None or key > best_key
         if improved:
             best_key, best_state, bad = key, {k: v.detach().cpu().clone() for k, v in evaluated.state_dict().items()}, 0

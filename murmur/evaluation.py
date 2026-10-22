@@ -128,12 +128,13 @@ def crossfit_decision(scores, y, folds):
     return {"folds": fold_ids.tolist(), "per_fold": per_fold, "pred": pred}
 
 
-def fit_decision(rec, patient_labels, patient_folds, methods=("mean", "max")):
+def fit_decision(rec, patient_labels, patient_folds, methods=("max", "mean"), tolerance=0.005):
     """Choose the decision rule by cross-fitted CV WA, then fit it on all OOF predictions.
 
     Candidates: every aggregation method, with the plain argmax or with tuned
-    multipliers. Tuning only pays off when it beats the argmax on held-out folds;
-    ties go to the simpler rule (argmax first, then the first method).
+    multipliers. The simplest candidate (argmax before tuned, then `methods` order)
+    whose CV WA is within `tolerance` of the best one is chosen, so that a rule is
+    never picked because of a difference that is only noise.
     rec: out-of-fold recording predictions (patient_id + PROB_COLS).
     patient_labels / patient_folds: Series indexed by patient_id.
     """
@@ -150,7 +151,9 @@ def fit_decision(rec, patient_labels, patient_folds, methods=("mean", "max")):
                        "confusion_matrix": confusion_matrix(y, cf["pred"][rule]).tolist()}
         results[method] = r
     candidates = [(False, m) for m in methods] + [(True, m) for m in methods]  # in order of preference
-    tuned, method = max(candidates, key=lambda c: results[c[1]]["tuned" if c[0] else "argmax"]["wa_mean"])
+    score = {c: results[c[1]]["tuned" if c[0] else "argmax"]["wa_mean"] for c in candidates}
+    best = max(score.values())
+    tuned, method = next(c for c in candidates if score[c] >= best - tolerance)
     chosen = results[method]["tuned" if tuned else "argmax"]
     return {"method": method, "tuned": tuned, "scale": results[method]["scale"] if tuned else [1.0, 1.0, 1.0],
             **chosen, "methods": results}

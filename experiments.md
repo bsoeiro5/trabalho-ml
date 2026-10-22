@@ -17,24 +17,52 @@ them, and what you changed").
 | Sempre *Absent* | 0.387 |
 | Sempre *Present* | 0.499 |
 
-## Experiências
+## Fase 1: receita de treino
+
+Valores: WA de CV com agregação *max* + argmax (a regra base), média ± dp nos 5 folds.
+
+| # | Experiência | Alteração | WA CV | Observações / decisão |
+|---|---|---|---|---|
+| 1 | `cnn_es` | CNN, até 60 épocas, *early stopping* na WA de validação (paciência 12) | 0.812 ± 0.022 | Curvas de validação muito ruidosas (WA 0.61–0.85 entre épocas). A época escolhida é um pico, o que torna as previsões OOF **otimistas**. |
+| 2 | `rnn_es` | RNN, mesma receita | 0.806 ± 0.022 | Mesmo padrão de erros que a CNN (Present 126/143, Unknown 0/54). |
+| 3 | `cnn_es-ema` | + média móvel exponencial dos pesos (0.995) | 0.808 ± 0.017 | Igual dentro do ruído, com menos variância entre folds. A comparação favorece injustamente o nº 1 (curvas mais ruidosas dão picos mais altos). |
+| 4 | `cnn_fixed30` | 30 épocas fixas (cosine até 0) + EMA, **sem escolher a época** no fold de validação | 0.794 ± 0.028 | OOF honesto: o otimismo do *early stopping* era ~2 pontos. Curvas suaves; a WA estabiliza a partir da época ~9. |
+| 5 | `rnn_fixed30` | idem para o RNN | (a correr) | |
+| 6 | `cnn` | **20 épocas fixas** + EMA (receita base da fase 2) | 0.785 ± 0.023 | ~1 ponto abaixo de 30 épocas (melhor ou igual em todos os folds). As ablações usam 20 épocas (comparação relativa, mais baratas); o modelo final usa 30. Nunca prevê Unknown (0/54). |
+| 7 | `rnn` | idem para o RNN | (em fila) | |
+
+**Decisão:** épocas fixas + EMA (20 nas ablações, 30 no modelo final). Com estimativas honestas, as ablações comparam-se com justiça.
+O teste dirá o valor real, sem ter servido para escolher nada.
+
+### Diário
+
+- **Agregação e regra de decisão (`cnn_es`, dev OOF).**
+  - *max* + argmax dá 0.812, contra 0.778 da *mean* + argmax: +3.4 pontos, como previsto (basta um foco com sopro).
+  - Afinar os multiplicadores **não** ajuda com *max* (0.802 cross-fitted), mas ajuda com *mean* (0.807, P×1.68, que compensa a diluição). Isto confirma o argumento de Bayes: com a perda pesada (5,3,1), o argmax já está perto do ótimo.
+  - Outras agregações testadas nas mesmas previsões OOF (U pelo máximo, A pelo mínimo, média dos 2 maiores P) não ganharam, e mantém-se *P max, U mean*.
+- **Onde erra (`cnn_es`, OOF pooled).**
+  - Recall: Present 128/143 (89.5%), Absent 509/556 (91.5%), Unknown **5/54** (9%).
+  - Os Unknown vão quase todos para Absent. Mesmo assim têm AUC 0.84 contra o resto (o Present tem 0.95): o modelo ordena-os razoavelmente, mas o score de Unknown nunca ganha.
+- **Ensemble CNN+RNN (`cnn_es` + `rnn_es`).** 0.808, sem ganho: as redes concordam em 93% das decisões (correlação 0.88 dos scores de Present).
+- **Regra escolhida por ruído.** Em `cnn_fixed30`, "mean + multiplicadores" ganhava a "max + argmax" por 0.0005. Passou a haver uma tolerância de 0.005: fica a regra mais simples, a não ser que outra seja claramente melhor.
+- **Paralelismo.** Duas experiências ao mesmo tempo na GPU (MPS) ficam 2–4× mais lentas cada uma. Corre-se uma na GPU (CNN) e uma no CPU (RNN).
+
+## Fase 2: ablações (com a receita escolhida na fase 1)
 
 | # | Experiência | Alteração | Hipótese | WA CV | Observações / decisão |
 |---|---|---|---|---|---|
-| 1 | `cnn` | CNN base (configs/cnn.yaml) | — | | |
-| 2 | `rnn` | RNN base (configs/rnn.yaml) | — | | |
-| 3 | `cnn_w-none` | Perda sem pesos | Prevê quase sempre Absent: recall de Present baixo, WA pior | | |
-| 4 | `cnn_w-balanced` | Pesos inverso da frequência (Unknown pesa ~10× Absent) | Sobre-prevê Unknown (a métrica só lhe dá peso 3) | | |
-| 5 | `cnn_lab-patient` | Gravações herdam a label do paciente (+ agregação mean) | Labels mais ruidosas (focos sem sopro marcados Present): pior | | |
-| 6 | `cnn_win2s` | Janelas de 2 s | Menos batidas por janela, menos contexto: pior? | | |
-| 7 | `cnn_win8s` | Janelas de 8 s | Mais contexto mas menos recortes distintos: ? | | |
-| 8 | `cnn_noaug` | Sem *augmentation* | Mais sobreajuste (gap treino/validação maior) | | |
-| 9 | `cnn_small` | Canais 8-16-32-64 (91 k parâmetros) | Pode chegar com tão poucos dados | | |
-| 10 | `cnn_big` | Canais 32-64-128-256 (1.2 M parâmetros) | Sobreajuste sem ganho | | |
-| 11 | `rnn_logmel` | RNN com log-mel 64 em vez de MFCC | Log-mel guarda mais detalhe espectral: ? | | |
-| 12 | `rnn_lstm` | LSTM em vez de GRU | Semelhante, mais lento | | |
-| 13 | `rnn_uni` | GRU unidirecional | Pior: perde o contexto futuro | | |
-| 14 | `cnn+rnn` | Ensemble (média das probabilidades) | Erros pouco correlacionados: ganho pequeno | | |
+| 6 | `cnn_w-none` | Perda sem pesos | Prevê quase sempre Absent: recall de Present baixo, WA pior | | |
+| 7 | `cnn_w-balanced` | Pesos inverso da frequência (Unknown pesa ~10× Absent) | Sobre-prevê Unknown (a métrica só lhe dá peso 3) | | |
+| 8 | `cnn_lab-patient` | Gravações herdam a label do paciente (+ agregação mean) | Labels mais ruidosas (focos sem sopro marcados Present): pior | | |
+| 9 | `cnn_win2s` | Janelas de 2 s | Menos batidas por janela, menos contexto: pior? | | |
+| 10 | `cnn_win8s` | Janelas de 8 s | Mais contexto mas menos recortes distintos: ? | | |
+| 11 | `cnn_noaug` | Sem *augmentation* | Mais sobreajuste (gap treino/validação maior) | | |
+| 12 | `cnn_small` | Canais 8-16-32-64 (91 k parâmetros) | Pode chegar com tão poucos dados | | |
+| 13 | `cnn_big` | Canais 32-64-128-256 (1.2 M parâmetros) | Sobreajuste sem ganho | | |
+| 14 | `rnn_logmel` | RNN com log-mel 64 em vez de MFCC | Log-mel guarda mais detalhe espectral: ? | | |
+| 15 | `rnn_lstm` | LSTM em vez de GRU | Semelhante, mais lento | | |
+| 16 | `rnn_uni` | GRU unidirecional | Pior: perde o contexto futuro | | |
+| 17 | `cnn+rnn` | Ensemble (média das probabilidades) | Erros pouco correlacionados: ganho pequeno | | |
 
 ## Notas
 

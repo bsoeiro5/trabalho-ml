@@ -33,7 +33,7 @@ from .evaluation import (PROB_COLS, bootstrap_ci, classification_metrics, decide
                          patient_scores, weighted_accuracy)
 from .models import build_model
 from .plots import plot_confusion_matrix, plot_cv_comparison, plot_learning_curves
-from .training import predict_recordings, train_model
+from .training import patient_wa, predict_recordings, train_model
 from .utils import Logger, get_device, load_config, load_json, save_config, save_json, set_seed
 
 DEFAULT_DEVICES = ("cuda", "mps", "cpu")
@@ -83,9 +83,17 @@ def combine_oof(oofs):
     return base
 
 
-def decision_for(oof, patient_labels, methods):
+def decision_for(oof, patient_labels, decision_cfg):
     """Decision rule (aggregation + multipliers) fitted on out-of-fold predictions."""
-    return fit_decision(oof, patient_labels, oof.groupby("patient_id")["fold"].first(), methods)
+    return fit_decision(oof, patient_labels, oof.groupby("patient_id")["fold"].first(),
+                        decision_cfg.get("methods", ("max", "mean")), decision_cfg.get("tolerance", 0.005))
+
+
+def cv_summary(name, cfg, oof, patient_labels, folds, all_data):
+    decision = decision_for(oof, patient_labels, cfg["decision"])
+    return {"experiment": name, "all_data": all_data, "folds": [int(k) for k in folds],
+            "decision": {k: v for k, v in decision.items() if k != "methods"},
+            "methods": decision["methods"]}, decision
 
 
 def fold_models(exp_dir, device):
@@ -109,7 +117,7 @@ def load_ensemble(exps, output_dir):
     loaded = [load_experiment(d) for d in exp_dirs]
     cfg = loaded[0][0]
     _, recordings, patient_labels, _ = load_dataset(cfg)
-    decision = decision_for(combine_oof([oof for _, _, oof in loaded]), patient_labels, cfg["decision"]["methods"])
+    decision = decision_for(combine_oof([oof for _, _, oof in loaded]), patient_labels, cfg["decision"])
     return exp_dirs, loaded, recordings, patient_labels, decision
 
 
@@ -210,14 +218,12 @@ def cmd_cv(args):
         oof[PROB_COLS] = predict_recordings(model, val_signals, length, hop, device)
         oof.to_csv(fold_dir / "oof.csv", index=False)
         oofs.append(oof)
-        log(f"fold {k} done in {(time.time() - t0) / 60:.1f} min (best val WA {history['val_wa'].max():.4f})")
+        fold_wa = patient_wa(va, oof[PROB_COLS].to_numpy(), patient_labels, cfg["decision"]["monitor"])
+        log(f"fold {k} done in {(time.time() - t0) / 60:.1f} min (validation WA of the kept weights {fold_wa:.4f})")
 
     oof = pd.concat(oofs, ignore_index=True)
     oof.to_csv(out / "oof_recordings.csv", index=False)
-    decision = decision_for(oof, patient_labels, cfg["decision"]["methods"])
-    summary = {"experiment": name, "all_data": args.all_data, "folds": [int(k) for k in folds],
-               "decision": {k: v for k, v in decision.items() if k != "methods"},
-               "methods": decision["methods"]}
+    summary, decision = cv_summary(name, cfg, oof, patient_labels, folds, args.all_data)
     save_json(summary, out / "cv_summary.json")
     log(f"\n=== {name}: patient-level weighted accuracy over {len(folds)} folds ===\n{describe_decision(decision)}")
 
@@ -313,8 +319,13 @@ def cmd_report(args):
     out.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    labels = None
     for d in dirs:
-        cfg, summary, _ = load_experiment(d)
+        cfg, summary, oof = load_experiment(d)
+        if labels is None:
+            labels = load_dataset(cfg)[2]
+        summary, _ = cv_summary(d.name, cfg, oof, labels, summary["folds"], summary["all_data"])
+        save_json(summary, d / "cv_summary.json")  # refreshed with the current decision code
         dec = summary["decision"]
         argmax = summary["methods"][dec["method"]]["argmax"]
         model, features = describe(cfg)

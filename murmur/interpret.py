@@ -1,8 +1,8 @@
-"""Where do the models look? RNN attention and CNN saliency, compared with the S1/systole/S2/diastole segmentation.
+"""Where do the models look? RNN attention and CNN occlusion, compared with the S1/systole/S2/diastole segmentation.
 
 The `.tsv` files give, for each recording, the cardiac state over time
 (0 unannotated, 1 S1, 2 systole, 3 S2, 4 diastole). If a model detects murmurs for
-the right reason, its attention/saliency should concentrate in systole (almost all
+the right reason, its attention/occlusion importance should concentrate in systole (almost all
 murmurs in the dataset are systolic).
 """
 from pathlib import Path
@@ -32,30 +32,47 @@ def state_per_frame(seg, start_s, n_frames, hop_s):
     return states
 
 
+def _batch(model, wave):
+    """One window as a batch of 1, on the device of the model."""
+    return torch.as_tensor(wave, dtype=torch.float32, device=next(model.parameters()).device)[None]
+
+
 @torch.no_grad()
 def rnn_attention(model, wave):
     """Class probabilities and attention weights over time (n_frames,) of an RNN model for one window."""
     model.eval()
-    logits, att = model(torch.as_tensor(wave, dtype=torch.float32)[None], return_attention=True)
-    return torch.softmax(logits, 1)[0].numpy(), att[0].numpy()
+    logits, att = model(_batch(model, wave), return_attention=True)
+    return torch.softmax(logits, 1)[0].cpu().numpy(), att[0].cpu().numpy()
 
 
-def cnn_saliency(model, wave, target=0):
-    """|gradient x input| of the `target` logit w.r.t. the log-mel features (F, T), for one window."""
+@torch.no_grad()
+def occlusion_profile(model, wave, width=6, stride=3, target=0):
+    """Class probabilities and importance over time (n_frames,) by occlusion, for one window.
+
+    Every block of `width` feature frames (6 x 16 ms ~ 100 ms) is replaced by the mean of
+    the window, and the importance of a frame is the average drop of P(target) when it is
+    hidden (negative drops are set to 0). Unlike gradients, this is not dominated by the
+    loudest sounds (S1/S2).
+    """
     model.eval()
-    feats = model.frontend(torch.as_tensor(wave, dtype=torch.float32)[None]).detach().requires_grad_(True)
-    logits = model.backbone(feats)
-    logits[0, target].backward()
-    return torch.softmax(logits.detach(), 1)[0].numpy(), (feats.grad * feats.detach()).abs()[0].numpy()
+    feats = model.frontend(_batch(model, wave))
+    p0 = torch.softmax(model.backbone(feats), 1)[0]
+    T = feats.shape[-1]
+    starts = list(range(0, T - width + 1, stride))
+    batch = feats.repeat(len(starts), 1, 1)
+    for i, s in enumerate(starts):
+        batch[i, :, s:s + width] = feats.mean()
+    drop = (p0[target] - torch.softmax(model.backbone(batch), 1)[:, target]).clamp(min=0).cpu().numpy()
+    importance, count = np.zeros(T), np.zeros(T)
+    for d, s in zip(drop, starts):
+        importance[s:s + width] += d
+        count[s:s + width] += 1
+    return p0.cpu().numpy(), importance / np.maximum(count, 1)
 
 
 def time_profile(model, wave, kind):
-    """Probabilities and per-frame importance for the Present class:
-    RNN attention, or CNN saliency summed over frequency."""
-    if kind == "rnn":
-        return rnn_attention(model, wave)
-    probs, saliency = cnn_saliency(model, wave, target=0)
-    return probs, saliency.sum(axis=0)
+    """Probabilities and per-frame importance for the Present class: RNN attention, or CNN occlusion."""
+    return rnn_attention(model, wave) if kind == "rnn" else occlusion_profile(model, wave)
 
 
 def attribution_by_state(model, kind, cfg, recordings, signals, max_windows=300):
@@ -72,18 +89,31 @@ def attribution_by_state(model, kind, cfg, recordings, signals, max_windows=300)
         for s in range(0, max(len(x) - length, 0) + 1, length):
             wave = np.pad(x[s:s + length], (0, max(0, length - len(x[s:s + length]))))
             _, w = time_profile(model, wave, kind)
-            rows.append(weight_by_state(w, state_per_frame(seg, s / fs, len(w), hop_s)))
+            states = state_per_frame(seg, s / fs, len(w), hop_s)
+            if (states != 0).mean() >= 0.5:  # skip windows that are mostly unannotated
+                rows.append(weight_by_state(w, states))
             if len(rows) >= max_windows:
-                return sum(rows) / len(rows), len(rows)
-    return (sum(rows) / len(rows), len(rows)) if rows else (None, 0)
+                break
+        if len(rows) >= max_windows:
+            break
+    if not rows:
+        return None, 0
+    shares = sum(r[["weight_share", "time_share"]] for r in rows) / len(rows)
+    shares["ratio"] = shares["weight_share"] / shares["time_share"]
+    return shares, len(rows)
 
 
 def weight_by_state(weights, states):
-    """Share of the total weight (attention or saliency over time) falling in each cardiac state,
-    next to the share of time spent in that state (the value expected from a uniform weighting)."""
-    weights = np.asarray(weights, dtype=float)
-    total = weights.sum()
-    return pd.DataFrame({
-        "weight_share": [weights[states == s].sum() / total for s in STATES],
-        "time_share": [(states == s).mean() for s in STATES],
-    }, index=list(STATES.values()))
+    """Share of the total weight (attention or occlusion importance over time) falling in each cardiac phase,
+    the share of time spent in that phase (what a uniform weighting would give) and their ratio
+    (> 1: the model looks at that phase more than its duration). Unannotated frames are ignored."""
+    weights, states = np.asarray(weights, dtype=float), np.asarray(states)
+    phases = {s: name for s, name in STATES.items() if s != 0}
+    annotated = states != 0
+    total, n = weights[annotated].sum(), annotated.sum()
+    df = pd.DataFrame({
+        "weight_share": [weights[states == s].sum() / total if total > 0 else np.nan for s in phases],
+        "time_share": [(states == s).sum() / n if n > 0 else np.nan for s in phases],
+    }, index=list(phases.values()))
+    df["ratio"] = df["weight_share"] / df["time_share"]
+    return df

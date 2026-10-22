@@ -165,7 +165,8 @@ def test_segmentation_frames():
     assert states.tolist() == [1, 2, 2, 3, 0, 0]
     shares = weight_by_state(np.array([0, 1, 1, 0, 0, 0]), states)
     assert np.isclose(shares.loc["systole", "weight_share"], 1.0)
-    assert np.isclose(shares.loc["systole", "time_share"], 2 / 6)
+    assert np.isclose(shares.loc["systole", "time_share"], 2 / 4)  # unannotated frames are ignored
+    assert np.isclose(shares.loc["systole", "ratio"], 2.0)
 
 
 def test_ema_moves_towards_the_weights():
